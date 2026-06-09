@@ -17,11 +17,22 @@ use tauri::{Manager, WindowEvent};
 #[cfg(not(test))]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let app_handle = app.handle().clone();
             let app_data_dir = app.path().app_data_dir()?;
-            let macro_dir = app_data_dir.join("macros");
-            std::fs::create_dir_all(&macro_dir)?;
+            let default_macro_dir = app_data_dir.join("macros");
+            std::fs::create_dir_all(&default_macro_dir)?;
+
+            let settings = app_state::load_settings(&app_data_dir);
+            let macro_dir = settings
+                .macro_directory
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .filter(|p| {
+                    std::fs::create_dir_all(p).is_ok() && p.is_dir()
+                })
+                .unwrap_or(default_macro_dir);
 
             let hotkey_config = hotkeys::load_or_default(&app_data_dir);
             let state = Arc::new(AppState::new(hotkey_config));
@@ -60,7 +71,9 @@ pub fn run() {
             ui_commands::get_hotkeys,
             ui_commands::set_hotkeys,
             ui_commands::get_playback_options,
-            ui_commands::set_playback_options
+            ui_commands::set_playback_options,
+            ui_commands::get_save_directory,
+            ui_commands::set_save_directory
         ])
         .run(tauri::generate_context!())
         .expect("error while running macro recorder");
