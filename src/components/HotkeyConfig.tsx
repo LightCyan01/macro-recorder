@@ -110,7 +110,7 @@ export function HotkeyConfigPanel({ persistedConfig, onSave }: HotkeyConfigProps
 
       {dirty ? (
         <div className="settings-actions">
-          <button type="button" onClick={save} disabled={saving}>
+          <button className="btn-primary" type="button" onClick={save} disabled={saving}>
             <Save size={15} />
             Save
           </button>
