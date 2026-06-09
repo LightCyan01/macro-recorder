@@ -1,5 +1,5 @@
 use crate::{
-    app_state::{AppState, PlaybackOptions},
+    app_state::{self, AppState, PlaybackOptions},
     engine::{player, recorder},
     hotkeys::{self, HotkeyConfig},
     macro_file::{self, MacroFile},
@@ -108,6 +108,7 @@ pub fn set_hotkeys(config: HotkeyConfig, state: State<'_, Arc<AppState>>) -> Res
     }
 
     hotkeys::save_hotkeys(&state.app_data_dir()?, &config)?;
+    state.update_hotkey_vk_codes(&config);
     *state
         .hotkeys
         .lock()
@@ -135,4 +136,39 @@ pub fn set_playback_options(
         .lock()
         .map_err(|_| "Playback options lock was poisoned".to_string())? = sanitized.clone();
     Ok(sanitized)
+}
+
+#[tauri::command]
+pub fn get_save_directory(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    let dir = state.macro_dir()?;
+    Ok(dir.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub fn set_save_directory(
+    path: String,
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<String, String> {
+    let dir = std::path::PathBuf::from(&path);
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir)
+            .map_err(|err| format!("Failed to create directory: {err}"))?;
+    }
+    if !dir.is_dir() {
+        return Err("The selected path is not a directory".to_string());
+    }
+
+    state.set_macro_dir(dir);
+
+    let app_data_dir = state.app_data_dir()?;
+    let settings = app_state::AppSettings {
+        macro_directory: Some(path.clone()),
+    };
+    app_state::save_settings(&app_data_dir, &settings)?;
+
+    let macros = state.refresh_macros_from_disk()?;
+    app.emit("macros-updated", macros).ok();
+
+    Ok(path)
 }
