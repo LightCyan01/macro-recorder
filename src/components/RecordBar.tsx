@@ -1,4 +1,4 @@
-import { Circle, Play, Square } from "lucide-react";
+import { Circle, Pause, Square } from "lucide-react";
 
 interface RecordBarProps {
   mode: "idle" | "recording" | "playing";
@@ -27,10 +27,10 @@ export function RecordBar({
           <p>{mode === "recording" ? "RECORDING" : mode === "playing" ? "PLAYING" : "READY"}</p>
           <strong>
             {mode === "recording"
-              ? `${eventCount.toLocaleString()} events`
+              ? `${eventCount.toLocaleString()} events captured`
               : mode === "playing"
                 ? playbackLabel
-                : "No active run"}
+                : "Waiting for input"}
           </strong>
         </div>
       </div>
@@ -43,19 +43,24 @@ export function RecordBar({
 
       <div className="control-cluster">
         {mode === "recording" ? (
-          <button className="danger" type="button" onClick={onStopRecording}>
-            <Square size={16} />
+          <button className="btn-stop-record" type="button" onClick={onStopRecording}>
+            <Square size={14} />
             Stop
           </button>
         ) : (
-          <button type="button" onClick={onStartRecording} disabled={mode === "playing"}>
-            <Circle size={16} />
+          <button className="btn-record" type="button" onClick={onStartRecording} disabled={mode === "playing"}>
+            <Circle size={14} />
             Record
           </button>
         )}
 
-        <button type="button" onClick={onStopPlayback} disabled={mode !== "playing"}>
-          <Play size={16} />
+        <button
+          className="btn-primary"
+          type="button"
+          onClick={onStopPlayback}
+          disabled={mode !== "playing"}
+        >
+          <Pause size={14} />
           Stop Play
         </button>
       </div>
