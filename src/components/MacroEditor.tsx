@@ -320,6 +320,7 @@ export function DelayEditorDialog({
         <div className="delay-dialog-actions">
           <button
             type="button"
+            className="btn-primary"
             disabled={saving}
             onClick={() => void onDone(durationMs)}
           >
