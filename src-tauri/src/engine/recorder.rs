@@ -10,7 +10,7 @@ use crate::{
 use std::{collections::HashSet, sync::atomic::Ordering, time::Instant};
 #[cfg(not(test))]
 use std::{
-    sync::{atomic::AtomicU32, mpsc, Arc},
+    sync::{atomic::AtomicU32, mpsc, Arc, Mutex, OnceLock},
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -30,12 +30,58 @@ use windows::Win32::{
 };
 
 #[cfg(all(windows, not(test)))]
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+#[cfg(all(windows, not(test)))]
 use windows::Win32::System::Threading::GetCurrentThreadId;
+
+#[cfg(not(test))]
+enum RawHookEvent {
+    Key {
+        vk_code: u16,
+        down: bool,
+        timestamp: Instant,
+    },
+    MouseMove {
+        x: i32,
+        y: i32,
+        timestamp: Instant,
+    },
+    MouseButton {
+        button: MouseButton,
+        down: bool,
+        x: i32,
+        y: i32,
+        timestamp: Instant,
+    },
+    MouseScroll {
+        delta: i32,
+        timestamp: Instant,
+    },
+}
+
+#[cfg(not(test))]
+static HOOK_SENDER: OnceLock<Mutex<Option<mpsc::SyncSender<RawHookEvent>>>> =
+    OnceLock::new();
+
+#[cfg(not(test))]
+fn hook_sender_slot() -> &'static Mutex<Option<mpsc::SyncSender<RawHookEvent>>> {
+    HOOK_SENDER.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(not(test))]
+fn try_send_hook_event(event: RawHookEvent) {
+    if let Ok(guard) = hook_sender_slot().lock() {
+        if let Some(sender) = guard.as_ref() {
+            let _ = sender.try_send(event);
+        }
+    }
+}
 
 #[cfg(not(test))]
 pub struct RecorderRuntime {
     thread_id: Arc<AtomicU32>,
     join: Option<JoinHandle<()>>,
+    drain_join: Option<JoinHandle<()>>,
 }
 
 #[cfg(not(test))]
@@ -50,6 +96,14 @@ impl RecorderRuntime {
         }
 
         if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+
+        if let Ok(mut guard) = hook_sender_slot().lock() {
+            *guard = None;
+        }
+
+        if let Some(join) = self.drain_join.take() {
             let _ = join.join();
         }
     }
@@ -79,17 +133,29 @@ pub fn start_recording(state: Arc<AppState>) -> Result<(), String> {
         .map_err(|_| "Recording key state lock was poisoned".to_string())?
         .clear();
 
+    let (event_tx, event_rx) = mpsc::sync_channel::<RawHookEvent>(4096);
+
+    if let Ok(mut guard) = hook_sender_slot().lock() {
+        *guard = Some(event_tx);
+    }
+
     let thread_id = Arc::new(AtomicU32::new(0));
     let thread_id_for_runtime = thread_id.clone();
     let state_for_thread = state.clone();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
 
+    let recording_start = Instant::now();
+    if let Ok(mut start_guard) = state.recording_started.lock() {
+        *start_guard = Some(recording_start);
+    }
+
+    let state_for_drain = state.clone();
+    let drain_join = thread::spawn(move || {
+        drain_loop(state_for_drain, event_rx, recording_start);
+    });
+
     let join = thread::spawn(move || {
         let _timer_guard = TimerResolutionGuard::request_500us();
-        let started = Instant::now();
-        if let Ok(mut start_guard) = state_for_thread.recording_started.lock() {
-            *start_guard = Some(started);
-        }
 
         run_hook_thread(state_for_thread.clone(), thread_id, ready_tx);
 
@@ -108,13 +174,18 @@ pub fn start_recording(state: Arc<AppState>) -> Result<(), String> {
                 Some(RecorderRuntime {
                     thread_id: thread_id_for_runtime,
                     join: Some(join),
+                    drain_join: Some(drain_join),
                 });
             emit_recording_count(&state, 0);
             Ok(())
         }
         Ok(Err(err)) => {
             state.recording.store(false, Ordering::Release);
+            if let Ok(mut guard) = hook_sender_slot().lock() {
+                *guard = None;
+            }
             let _ = join.join();
+            let _ = drain_join.join();
             Err(err)
         }
         Err(_) => {
@@ -126,9 +197,91 @@ pub fn start_recording(state: Arc<AppState>) -> Result<(), String> {
                     let _ = PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
                 }
             }
+            if let Ok(mut guard) = hook_sender_slot().lock() {
+                *guard = None;
+            }
             let _ = join.join();
+            let _ = drain_join.join();
             Err("Timed out while starting recorder hook thread".to_string())
         }
+    }
+}
+
+#[cfg(not(test))]
+fn drain_loop(
+    state: Arc<AppState>,
+    rx: mpsc::Receiver<RawHookEvent>,
+    recording_start: Instant,
+) {
+    let mut last_emit = Instant::now();
+    let emit_interval = Duration::from_millis(50);
+
+    loop {
+        let event = match rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(event) => Some(event),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        if !state.recording.load(Ordering::Acquire) {
+            break;
+        }
+
+        if let Some(event) = event {
+            let elapsed_ms = event_timestamp(&event)
+                .duration_since(recording_start)
+                .as_secs_f64()
+                * 1000.0;
+
+            let macro_event = match event {
+                RawHookEvent::Key { vk_code, down, .. } => {
+                    if down {
+                        Some(MacroEvent::KeyDown { vk_code, elapsed_ms })
+                    } else {
+                        Some(MacroEvent::KeyUp { vk_code, elapsed_ms })
+                    }
+                }
+                RawHookEvent::MouseMove { x, y, .. } => {
+                    Some(MacroEvent::MouseMove { x, y, elapsed_ms })
+                }
+                RawHookEvent::MouseButton { button, down, x, y, .. } => {
+                    if down {
+                        Some(MacroEvent::MouseDown { button, x, y, elapsed_ms })
+                    } else {
+                        Some(MacroEvent::MouseUp { button, x, y, elapsed_ms })
+                    }
+                }
+                RawHookEvent::MouseScroll { delta, .. } => {
+                    Some(MacroEvent::MouseScroll { delta, elapsed_ms })
+                }
+            };
+
+            if let Some(event) = macro_event {
+                if push_recorded_event(&state, event) {
+                    state.recorded_event_count.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+        }
+
+        let now = Instant::now();
+        if now.duration_since(last_emit) >= emit_interval {
+            let count = state.recorded_event_count.load(Ordering::Acquire);
+            emit_recording_count(&state, count);
+            last_emit = now;
+        }
+    }
+
+    let count = state.recorded_event_count.load(Ordering::Acquire);
+    emit_recording_count(&state, count);
+}
+
+#[cfg(not(test))]
+fn event_timestamp(event: &RawHookEvent) -> Instant {
+    match event {
+        RawHookEvent::Key { timestamp, .. }
+        | RawHookEvent::MouseMove { timestamp, .. }
+        | RawHookEvent::MouseButton { timestamp, .. }
+        | RawHookEvent::MouseScroll { timestamp, .. } => *timestamp,
     }
 }
 
@@ -209,21 +362,6 @@ fn emit_recording_count(state: &AppState, count: u64) {
     }
 }
 
-#[cfg(not(test))]
-fn push_event(event: MacroEvent) {
-    let Some(state) = global_state() else {
-        return;
-    };
-    if !state.recording.load(Ordering::Acquire) {
-        return;
-    }
-
-    if push_recorded_event(&state, event) {
-        let count = state.recorded_event_count.fetch_add(1, Ordering::AcqRel) + 1;
-        emit_recording_count(&state, count);
-    }
-}
-
 #[cfg(test)]
 pub(crate) fn record_keyboard_event_for_test(state: &AppState, vk_code: u16) {
     record_keyboard_transition_for_test(state, vk_code, true);
@@ -235,13 +373,9 @@ pub(crate) fn record_keyboard_transition_for_test(state: &AppState, vk_code: u16
         return;
     }
 
-    let Ok(config) = state.hotkeys.lock() else {
-        return;
-    };
-    if should_suppress_hotkey_vk(vk_code, &config) {
+    if state.is_hotkey_vk(vk_code) {
         return;
     }
-    drop(config);
 
     let Some(elapsed_ms) = elapsed_ms(state) else {
         return;
@@ -320,14 +454,12 @@ pub(crate) fn append_missing_keyups(
     }
 }
 
+#[cfg(all(windows, not(test)))]
 fn is_suppressed_hotkey(vk_code: u16) -> bool {
     let Some(state) = global_state() else {
         return false;
     };
-    let Ok(config) = state.hotkeys.lock() else {
-        return false;
-    };
-    should_suppress_hotkey_vk(vk_code, &config)
+    state.is_hotkey_vk(vk_code)
 }
 
 pub(crate) fn should_suppress_hotkey_vk(
@@ -352,8 +484,10 @@ fn run_hook_thread(
         thread_id.store(GetCurrentThreadId(), Ordering::Release);
     }
 
+    let hmod = unsafe { GetModuleHandleW(None).unwrap_or_default() };
+
     let keyboard_hook = unsafe {
-        match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), None, 0) {
+        match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), hmod, 0) {
             Ok(hook) => hook,
             Err(err) => {
                 let _ = ready_tx.send(Err(format!("Failed to install keyboard hook: {err}")));
@@ -362,7 +496,7 @@ fn run_hook_thread(
         }
     };
     let mouse_hook = unsafe {
-        match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), None, 0) {
+        match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), hmod, 0) {
             Ok(hook) => hook,
             Err(err) => {
                 unhook(keyboard_hook);
@@ -414,29 +548,22 @@ fn unhook(hook: HHOOK) {
 #[cfg(all(windows, not(test)))]
 unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
-        if let Some(state) = global_state() {
-            let keyboard = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-            let vk_code = keyboard.vkCode as u16;
-            if is_suppressed_hotkey(vk_code) {
-                return CallNextHookEx(None, code, wparam, lparam);
-            }
+        let keyboard = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        let vk_code = keyboard.vkCode as u16;
 
-            if let Some(elapsed_ms) = elapsed_ms(&state) {
-                let event = match wparam.0 as u32 {
-                    WM_KEYDOWN | WM_SYSKEYDOWN => Some(MacroEvent::KeyDown {
-                        vk_code,
-                        elapsed_ms,
-                    }),
-                    WM_KEYUP | WM_SYSKEYUP => Some(MacroEvent::KeyUp {
-                        vk_code,
-                        elapsed_ms,
-                    }),
-                    _ => None,
-                };
+        if !is_suppressed_hotkey(vk_code) {
+            let down = match wparam.0 as u32 {
+                WM_KEYDOWN | WM_SYSKEYDOWN => Some(true),
+                WM_KEYUP | WM_SYSKEYUP => Some(false),
+                _ => None,
+            };
 
-                if let Some(event) = event {
-                    push_event(event);
-                }
+            if let Some(down) = down {
+                try_send_hook_event(RawHookEvent::Key {
+                    vk_code,
+                    down,
+                    timestamp: Instant::now(),
+                });
             }
         }
     }
@@ -447,60 +574,64 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
 #[cfg(all(windows, not(test)))]
 unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
-        if let Some(state) = global_state() {
-            let mouse = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-            if let Some(elapsed_ms) = elapsed_ms(&state) {
-                let x = mouse.pt.x;
-                let y = mouse.pt.y;
-                let event = match wparam.0 as u32 {
-                    WM_MOUSEMOVE => Some(MacroEvent::MouseMove { x, y, elapsed_ms }),
-                    WM_LBUTTONDOWN => Some(MacroEvent::MouseDown {
-                        button: MouseButton::Left,
-                        x,
-                        y,
-                        elapsed_ms,
-                    }),
-                    WM_LBUTTONUP => Some(MacroEvent::MouseUp {
-                        button: MouseButton::Left,
-                        x,
-                        y,
-                        elapsed_ms,
-                    }),
-                    WM_RBUTTONDOWN => Some(MacroEvent::MouseDown {
-                        button: MouseButton::Right,
-                        x,
-                        y,
-                        elapsed_ms,
-                    }),
-                    WM_RBUTTONUP => Some(MacroEvent::MouseUp {
-                        button: MouseButton::Right,
-                        x,
-                        y,
-                        elapsed_ms,
-                    }),
-                    WM_MBUTTONDOWN => Some(MacroEvent::MouseDown {
-                        button: MouseButton::Middle,
-                        x,
-                        y,
-                        elapsed_ms,
-                    }),
-                    WM_MBUTTONUP => Some(MacroEvent::MouseUp {
-                        button: MouseButton::Middle,
-                        x,
-                        y,
-                        elapsed_ms,
-                    }),
-                    WM_MOUSEWHEEL => {
-                        let delta = ((mouse.mouseData >> 16) & 0xffff) as i16 as i32;
-                        Some(MacroEvent::MouseScroll { delta, elapsed_ms })
-                    }
-                    _ => None,
-                };
+        let mouse = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+        let x = mouse.pt.x;
+        let y = mouse.pt.y;
+        let timestamp = Instant::now();
 
-                if let Some(event) = event {
-                    push_event(event);
-                }
+        let event = match wparam.0 as u32 {
+            WM_MOUSEMOVE => Some(RawHookEvent::MouseMove { x, y, timestamp }),
+            WM_LBUTTONDOWN => Some(RawHookEvent::MouseButton {
+                button: MouseButton::Left,
+                down: true,
+                x,
+                y,
+                timestamp,
+            }),
+            WM_LBUTTONUP => Some(RawHookEvent::MouseButton {
+                button: MouseButton::Left,
+                down: false,
+                x,
+                y,
+                timestamp,
+            }),
+            WM_RBUTTONDOWN => Some(RawHookEvent::MouseButton {
+                button: MouseButton::Right,
+                down: true,
+                x,
+                y,
+                timestamp,
+            }),
+            WM_RBUTTONUP => Some(RawHookEvent::MouseButton {
+                button: MouseButton::Right,
+                down: false,
+                x,
+                y,
+                timestamp,
+            }),
+            WM_MBUTTONDOWN => Some(RawHookEvent::MouseButton {
+                button: MouseButton::Middle,
+                down: true,
+                x,
+                y,
+                timestamp,
+            }),
+            WM_MBUTTONUP => Some(RawHookEvent::MouseButton {
+                button: MouseButton::Middle,
+                down: false,
+                x,
+                y,
+                timestamp,
+            }),
+            WM_MOUSEWHEEL => {
+                let delta = ((mouse.mouseData >> 16) & 0xffff) as i16 as i32;
+                Some(RawHookEvent::MouseScroll { delta, timestamp })
             }
+            _ => None,
+        };
+
+        if let Some(event) = event {
+            try_send_hook_event(event);
         }
     }
 
