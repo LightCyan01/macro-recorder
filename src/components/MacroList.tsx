@@ -22,7 +22,7 @@ export function MacroList({
     return (
       <section className="empty-state">
         <h2>Macro Library</h2>
-        <p>No saved macros yet.</p>
+        <p>No saved macros yet. Hit Record to create your first one.</p>
       </section>
     );
   }
@@ -62,7 +62,7 @@ export function MacroList({
                       onPlay(macro.name);
                     }}
                   >
-                    <Play size={15} />
+                    <Play size={14} />
                   </button>
                   <button
                     type="button"
@@ -72,7 +72,7 @@ export function MacroList({
                       onRename(macro);
                     }}
                   >
-                    <Pencil size={15} />
+                    <Pencil size={14} />
                   </button>
                   <button
                     className="icon-danger"
@@ -83,7 +83,7 @@ export function MacroList({
                       onDelete(macro.name);
                     }}
                   >
-                    <Trash2 size={15} />
+                    <Trash2 size={14} />
                   </button>
                 </div>
               </td>
