@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import type { HotkeyConfig, MacroFile, PlaybackOptions } from "./types";
 
 export function listMacros(): Promise<MacroFile[]> {
@@ -47,4 +48,21 @@ export function getPlaybackOptions(): Promise<PlaybackOptions> {
 
 export function setPlaybackOptions(options: PlaybackOptions): Promise<PlaybackOptions> {
   return invoke("set_playback_options", { options });
+}
+
+export function getSaveDirectory(): Promise<string> {
+  return invoke("get_save_directory");
+}
+
+export function setSaveDirectory(path: string): Promise<string> {
+  return invoke("set_save_directory", { path });
+}
+
+export async function pickDirectory(defaultPath?: string): Promise<string | null> {
+  const selected = await open({
+    directory: true,
+    multiple: false,
+    defaultPath
+  });
+  return selected as string | null;
 }
