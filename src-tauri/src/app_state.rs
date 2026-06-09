@@ -7,9 +7,10 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
-    path::PathBuf,
+    fs,
+    path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
     },
     time::Instant,
@@ -64,6 +65,7 @@ pub struct AppState {
     #[cfg(not(test))]
     pub hotkey_runtime: Mutex<Option<HotkeyRuntime>>,
     pub recording_started: Mutex<Option<Instant>>,
+    pub hotkey_vk_codes: [AtomicU16; 3],
     app_data_dir: Mutex<Option<PathBuf>>,
     macro_dir: Mutex<Option<PathBuf>>,
     #[cfg(not(test))]
@@ -72,6 +74,11 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(hotkeys: HotkeyConfig) -> Self {
+        let hotkey_vk_codes = [
+            AtomicU16::new(hotkeys.record_toggle.vk_code),
+            AtomicU16::new(hotkeys.play_toggle.vk_code),
+            AtomicU16::new(hotkeys.emergency_stop.vk_code),
+        ];
         Self {
             recording: AtomicBool::new(false),
             playing: AtomicBool::new(false),
@@ -91,6 +98,7 @@ impl AppState {
             #[cfg(not(test))]
             hotkey_runtime: Mutex::new(None),
             recording_started: Mutex::new(None),
+            hotkey_vk_codes,
             app_data_dir: Mutex::new(None),
             macro_dir: Mutex::new(None),
             #[cfg(not(test))]
@@ -174,10 +182,49 @@ impl AppState {
             .map_err(|_| "Playing macro lock was poisoned".to_string())? = name;
         Ok(())
     }
+
+    pub fn update_hotkey_vk_codes(&self, config: &HotkeyConfig) {
+        self.hotkey_vk_codes[0].store(config.record_toggle.vk_code, Ordering::Release);
+        self.hotkey_vk_codes[1].store(config.play_toggle.vk_code, Ordering::Release);
+        self.hotkey_vk_codes[2].store(config.emergency_stop.vk_code, Ordering::Release);
+    }
+
+    pub fn is_hotkey_vk(&self, vk_code: u16) -> bool {
+        self.hotkey_vk_codes[0].load(Ordering::Relaxed) == vk_code
+            || self.hotkey_vk_codes[1].load(Ordering::Relaxed) == vk_code
+            || self.hotkey_vk_codes[2].load(Ordering::Relaxed) == vk_code
+    }
 }
 
 pub static GLOBAL_STATE: OnceLock<Arc<AppState>> = OnceLock::new();
 
 pub fn global_state() -> Option<Arc<AppState>> {
     GLOBAL_STATE.get().cloned()
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct AppSettings {
+    #[serde(default)]
+    pub macro_directory: Option<String>,
+}
+
+fn settings_path(app_data_dir: &Path) -> PathBuf {
+    app_data_dir.join("settings.json")
+}
+
+pub fn load_settings(app_data_dir: &Path) -> AppSettings {
+    let path = settings_path(app_data_dir);
+    fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<AppSettings>(&bytes).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_settings(app_data_dir: &Path, settings: &AppSettings) -> Result<(), String> {
+    fs::create_dir_all(app_data_dir)
+        .map_err(|err| format!("Failed to create app data directory: {err}"))?;
+    let json = serde_json::to_string_pretty(settings)
+        .map_err(|err| format!("Failed to serialize settings: {err}"))?;
+    fs::write(settings_path(app_data_dir), json)
+        .map_err(|err| format!("Failed to save settings: {err}"))
 }
